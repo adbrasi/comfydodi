@@ -30,10 +30,11 @@ class CivitAI_Model:
     num_chunks = 8
     chunk_size = 1024 * 1024  # Increased from 1KB to 1MB for better performance
     max_retries = 120
+    chunk_retry_timeout = 120  # seconds before abandoning a stalled chunk
     debug_response = False
     warning = False
 
-    def __init__(self, model_id, save_path, model_paths, model_types=[], token=None, model_version=None, download_chunks=None, max_download_retries=None, warning=True, debug_response=False):
+    def __init__(self, model_id, save_path, model_paths, model_types=[], token=None, model_version=None, download_chunks=None, max_download_retries=None, max_download_retry_time=None, warning=True, debug_response=False):
         self.model_id = model_id
         self.version = model_version
         self.type = None
@@ -49,6 +50,15 @@ class CivitAI_Model:
         self.file_size = 0
         self.trained_words = None
         self.warning = warning
+        self.max_retry_time = self.chunk_retry_timeout
+
+        if max_download_retry_time is not None:
+            try:
+                self.max_retry_time = int(max_download_retry_time)
+            except (TypeError, ValueError):
+                self.max_retry_time = self.chunk_retry_timeout
+        if self.max_retry_time is not None and self.max_retry_time <= 0:
+            self.max_retry_time = None
         
         if download_chunks:
             self.num_chunks = int(download_chunks)
@@ -198,13 +208,16 @@ class CivitAI_Model:
     
         # DOWNLAOD BYTE CHUNK
         
-        def download_chunk(chunk_id, url, chunk_size, start_byte, end_byte, file_path, total_pbar, comfy_pbar, max_retries=30):
+        def download_chunk(chunk_id, url, chunk_size, start_byte, end_byte, file_path, total_pbar, comfy_pbar, max_retries=30, max_retry_time=None):
             retries = 0
             retry_delay = 5
             chunk_complete = False
             downloaded_bytes = 0
+            last_progress_time = time.monotonic()
 
             while retries <= max_retries:
+                if max_retry_time and (time.monotonic() - last_progress_time) >= max_retry_time:
+                    raise Exception(f"{ERR_PREFIX}Chunk {chunk_id} stalled for more than {max_retry_time} seconds without progress.")
                 try:
                     headers = {'Range': f'bytes={start_byte + downloaded_bytes}-{end_byte}'}
                     response = requests.get(url, headers=headers, stream=True, timeout=30)
@@ -227,6 +240,7 @@ class CivitAI_Model:
                                     
                                 buffer.extend(data_chunk)
                                 downloaded_bytes += len(data_chunk)
+                                last_progress_time = time.monotonic()
                                 
                                 # Write buffer when it's full or we've reached the end
                                 if len(buffer) >= buffer_size or start_byte + downloaded_bytes >= end_byte:
@@ -235,6 +249,7 @@ class CivitAI_Model:
                                     total_pbar.update(len(buffer))
                                     comfy_pbar.update(len(buffer))
                                     buffer.clear()
+                                    last_progress_time = time.monotonic()
                                 
                                 retries = 0
                                 if start_byte + downloaded_bytes >= end_byte:
@@ -247,6 +262,7 @@ class CivitAI_Model:
                                 file.flush()
                                 total_pbar.update(len(buffer))
                                 comfy_pbar.update(len(buffer))
+                                last_progress_time = time.monotonic()
 
                         comfy_pbar.set_postfix_str(f"Chunk {chunk_id}: {downloaded_bytes} bytes downloaded")
                     else:
@@ -349,7 +365,7 @@ class CivitAI_Model:
                 end_byte = start_byte + (total_file_size // self.num_chunks) - 1
                 if i == self.num_chunks - 1:
                     end_byte = total_file_size - 1
-                future = executor.submit(download_chunk, i, self.download_url, self.chunk_size, start_byte, end_byte, save_path, total_pbar, comfy_pbar, self.max_retries)
+                future = executor.submit(download_chunk, i, self.download_url, self.chunk_size, start_byte, end_byte, save_path, total_pbar, comfy_pbar, self.max_retries, self.max_retry_time)
                 futures.append(future)
 
             for future in futures:
