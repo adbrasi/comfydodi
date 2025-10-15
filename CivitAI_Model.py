@@ -30,13 +30,11 @@ class CivitAI_Model:
     num_chunks = 8
     chunk_size = 1024 * 1024  # Increased from 1KB to 1MB for better performance
     max_retries = 120
-    retry_delay_seconds = 5
-    chunk_progress_timeout_seconds = 200  # Seconds without progress before aborting a chunk
-    download_timeout_seconds = 0  # Disabled by default
+    chunk_retry_timeout = 120  # seconds before abandoning a stalled chunk
     debug_response = False
     warning = False
 
-    def __init__(self, model_id, save_path, model_paths, model_types=[], token=None, model_version=None, download_chunks=None, max_download_retries=None, warning=True, debug_response=False, download_timeout=None, progress_timeout=None, retry_delay=None):
+    def __init__(self, model_id, save_path, model_paths, model_types=[], token=None, model_version=None, download_chunks=None, max_download_retries=None, max_download_retry_time=None, warning=True, debug_response=False):
         self.model_id = model_id
         self.version = model_version
         self.type = None
@@ -52,10 +50,16 @@ class CivitAI_Model:
         self.file_size = 0
         self.trained_words = None
         self.warning = warning
-        self.retry_delay = self.retry_delay_seconds
-        self.chunk_progress_timeout = self.chunk_progress_timeout_seconds
-        self.download_timeout = self.download_timeout_seconds
+        self.max_retry_time = self.chunk_retry_timeout
 
+        if max_download_retry_time is not None:
+            try:
+                self.max_retry_time = int(max_download_retry_time)
+            except (TypeError, ValueError):
+                self.max_retry_time = self.chunk_retry_timeout
+        if self.max_retry_time is not None and self.max_retry_time <= 0:
+            self.max_retry_time = None
+        
         if download_chunks:
             self.num_chunks = int(download_chunks)
 
@@ -64,18 +68,9 @@ class CivitAI_Model:
 
         if max_download_retries:
             self.max_retries = int(max_download_retries)
-
+            
         if debug_response:
             self.debug_response = True
-
-        if download_timeout is not None:
-            self.download_timeout = max(0, int(download_timeout))
-
-        if progress_timeout is not None:
-            self.chunk_progress_timeout = max(0, int(progress_timeout))
-
-        if retry_delay is not None:
-            self.retry_delay = max(1, int(retry_delay))
 
         self.details()
 
@@ -213,99 +208,83 @@ class CivitAI_Model:
     
         # DOWNLAOD BYTE CHUNK
         
-        def download_chunk(chunk_id, url, chunk_size, start_byte, end_byte, file_path, total_pbar, comfy_pbar, max_retries=30, retry_delay=5, deadline=None, progress_timeout=None):
-            chunk_length = (end_byte - start_byte) + 1
+        def download_chunk(chunk_id, url, chunk_size, start_byte, end_byte, file_path, total_pbar, comfy_pbar, max_retries=30, max_retry_time=None):
+            retries = 0
+            retry_delay = 5
+            chunk_complete = False
             downloaded_bytes = 0
-            attempts = 0
-            max_attempts = max(1, max_retries + 1)
-            last_error = None
+            last_progress_time = time.monotonic()
 
-            while downloaded_bytes < chunk_length and attempts < max_attempts:
-                if attempts > 0 and retry_delay:
-                    print(f"{MSG_PREFIX}Chunk {chunk_id} retry {attempts} of {max_retries} in {retry_delay}s")
-                    time.sleep(retry_delay)
-
-                if deadline and time.monotonic() > deadline:
-                    raise TimeoutError(f"{ERR_PREFIX}Chunk {chunk_id} exceeded the overall download timeout.")
-
-                last_error = None
-
+            while retries <= max_retries:
+                if max_retry_time and (time.monotonic() - last_progress_time) >= max_retry_time:
+                    raise Exception(f"{ERR_PREFIX}Chunk {chunk_id} stalled for more than {max_retry_time} seconds without progress.")
                 try:
                     headers = {'Range': f'bytes={start_byte + downloaded_bytes}-{end_byte}'}
-                    with requests.get(url, headers=headers, stream=True, timeout=30) as response:
-                        if response.status_code != 206:
-                            raise requests.exceptions.HTTPError(f"Unexpected status code {response.status_code}")
+                    response = requests.get(url, headers=headers, stream=True, timeout=30)
+                    if response.status_code == 206:
+                        if retries > 0:
+                            print(f"{MSG_PREFIX}Chunk {chunk_id} re-established in {retry_delay}s")
+                            time.sleep(retry_delay)
 
-                        last_progress = time.monotonic()
+                        # Open file once for the entire chunk download
                         with open(file_path, 'r+b') as file:
                             file.seek(start_byte + downloaded_bytes)
-
+                            
+                            # Buffer data before writing to reduce I/O operations
                             buffer = bytearray()
                             buffer_size = 64 * 1024  # 64KB buffer
-
+                            
                             for data_chunk in response.iter_content(chunk_size=chunk_size):
-                                now = time.monotonic()
-
-                                if deadline and now > deadline:
-                                    raise TimeoutError(f"{ERR_PREFIX}Chunk {chunk_id} exceeded the overall download timeout.")
-
-                                if progress_timeout and (now - last_progress) > progress_timeout:
-                                    raise TimeoutError(f"{ERR_PREFIX}Chunk {chunk_id} stalled for {progress_timeout} seconds without progress.")
-
                                 if not data_chunk:
                                     continue
-
+                                    
                                 buffer.extend(data_chunk)
                                 downloaded_bytes += len(data_chunk)
-                                last_progress = now
-
-                                if len(buffer) >= buffer_size or downloaded_bytes >= chunk_length:
-                                    bytes_to_write = len(buffer)
+                                last_progress_time = time.monotonic()
+                                
+                                # Write buffer when it's full or we've reached the end
+                                if len(buffer) >= buffer_size or start_byte + downloaded_bytes >= end_byte:
                                     file.write(buffer)
-                                    file.flush()
-                                    total_pbar.update(bytes_to_write)
-                                    comfy_pbar.update(bytes_to_write)
+                                    file.flush()  # Ensure data is written to disk
+                                    total_pbar.update(len(buffer))
+                                    comfy_pbar.update(len(buffer))
                                     buffer.clear()
-
-                                if downloaded_bytes >= chunk_length:
+                                    last_progress_time = time.monotonic()
+                                
+                                retries = 0
+                                if start_byte + downloaded_bytes >= end_byte:
+                                    chunk_complete = True
                                     break
-
+                            
+                            # Write any remaining data in buffer
                             if buffer:
-                                bytes_to_write = len(buffer)
                                 file.write(buffer)
                                 file.flush()
-                                total_pbar.update(bytes_to_write)
-                                comfy_pbar.update(bytes_to_write)
+                                total_pbar.update(len(buffer))
+                                comfy_pbar.update(len(buffer))
+                                last_progress_time = time.monotonic()
 
-                    if downloaded_bytes >= chunk_length:
                         comfy_pbar.set_postfix_str(f"Chunk {chunk_id}: {downloaded_bytes} bytes downloaded")
-                        return
+                    else:
+                        raise Exception(f"{ERR_PREFIX}Unable to establish download connection.")
+                except (requests.exceptions.RequestException, Exception) as e:
+                    # We shouldn't warn on chunk loss, since end chunks may not be able to be established due to remaining filesize
+                    #print(f"{WARN_PREFIX}Chunk {chunk_id} connection lost") 
+                    time.sleep(retry_delay)
+                    retries += 1
+                    if retries > max_retries:
+                        print(f"{ERR_PREFIX}Chunk {chunk_id} failed to download after {max_retries} retries.")
+                        break
 
-                    last_error = Exception(f"{ERR_PREFIX}Chunk {chunk_id} connection closed before completion.")
+                if chunk_complete:
+                    break
+                    
+            if not chunk_complete:
+                raise Exception(f"{ERR_PREFIX}Unable to re-establish connection to CivitAI.")
 
-                except TimeoutError as timeout_error:
-                    raise timeout_error
-                except requests.exceptions.RequestException as request_error:
-                    last_error = request_error
-                except Exception as generic_error:
-                    last_error = generic_error
-
-                attempts += 1
-
-            if downloaded_bytes >= chunk_length:
-                comfy_pbar.set_postfix_str(f"Chunk {chunk_id}: {downloaded_bytes} bytes downloaded")
-                return
-
-            if attempts >= max_attempts:
-                cause = last_error if last_error else None
-                raise Exception(f"{ERR_PREFIX}Chunk {chunk_id} failed to download after {max_retries} retries.") from cause
-
-            cause = last_error if last_error else None
-            raise Exception(f"{ERR_PREFIX}Unable to re-establish connection to CivitAI.") from cause
-
-
+                
         # GET FILE SIZE
-
+        
         def get_total_file_size(url):
             response = requests.get(url, stream=True)
             content_length = response.headers.get('Content-Length')
@@ -376,47 +355,23 @@ class CivitAI_Model:
             file.seek(total_file_size - 1)
             file.write(b'\0')
 
-        download_deadline = None
-        if self.download_timeout:
-            download_deadline = time.monotonic() + self.download_timeout
-
         futures = []
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_chunks) as executor:
-                with tqdm(total=total_file_size, unit='B', unit_scale=True, unit_divisor=1024, leave=True) as total_pbar:
-                    comfy_pbar = comfy.utils.ProgressBar(total_file_size)
-                    comfy_pbar.update(0)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.num_chunks) as executor:
+            total_pbar = tqdm(total=total_file_size, unit='B', unit_scale=True, unit_divisor=1024, leave=True)
+            comfy_pbar = comfy.utils.ProgressBar(total_file_size)
+            comfy_pbar.update(0)
+            for i in range(self.num_chunks):
+                start_byte = i * (total_file_size // self.num_chunks)
+                end_byte = start_byte + (total_file_size // self.num_chunks) - 1
+                if i == self.num_chunks - 1:
+                    end_byte = total_file_size - 1
+                future = executor.submit(download_chunk, i, self.download_url, self.chunk_size, start_byte, end_byte, save_path, total_pbar, comfy_pbar, self.max_retries, self.max_retry_time)
+                futures.append(future)
 
-                    for i in range(self.num_chunks):
-                        start_byte = i * (total_file_size // self.num_chunks)
-                        end_byte = start_byte + (total_file_size // self.num_chunks) - 1
-                        if i == self.num_chunks - 1:
-                            end_byte = total_file_size - 1
-
-                        future = executor.submit(
-                            download_chunk,
-                            i,
-                            self.download_url,
-                            self.chunk_size,
-                            start_byte,
-                            end_byte,
-                            save_path,
-                            total_pbar,
-                            comfy_pbar,
-                            self.max_retries,
-                            self.retry_delay,
-                            download_deadline,
-                            self.chunk_progress_timeout,
-                        )
-                        futures.append(future)
-
-                    for future in futures:
-                        future.result()
-        except Exception:
-            if os.path.exists(save_path):
-                os.remove(save_path)
-            raise
-
+            for future in futures:
+                future.result()
+                
+            total_pbar.close()
         model_sha256 = CivitAI_Model.calculate_sha256(save_path)
         if model_sha256 == self.file_sha256:
             print(f"{MSG_PREFIX}Loading {self.type}: {self.name} (https://civitai.com/models/{self.model_id}/?modelVersionId={self.version})")
