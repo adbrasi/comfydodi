@@ -33,6 +33,7 @@ class CivitAI_Model:
     chunk_retry_timeout = 120  # seconds before abandoning a stalled chunk
     debug_response = False
     warning = False
+    _last_token = None
 
     def __init__(self, model_id, save_path, model_paths, model_types=[], token=None, model_version=None, download_chunks=None, max_download_retries=None, max_download_retry_time=None, warning=True, debug_response=False):
         self.model_id = model_id
@@ -51,6 +52,16 @@ class CivitAI_Model:
         self.trained_words = None
         self.warning = warning
         self.max_retry_time = self.chunk_retry_timeout
+        self.token = None
+        token_value = token.strip() if isinstance(token, str) else token
+        if token_value:
+            self.token = token_value
+        self._auth_headers = {}
+        self._auth_params = {}
+        if self.token:
+            self._auth_headers["Authorization"] = f"Bearer {self.token}"
+            self._auth_params["token"] = self.token
+            CivitAI_Model._last_token = self.token
 
         if max_download_retry_time is not None:
             try:
@@ -62,9 +73,6 @@ class CivitAI_Model:
         
         if download_chunks:
             self.num_chunks = int(download_chunks)
-
-        if token:
-            self.token = token
 
         if max_download_retries:
             self.max_retries = int(max_download_retries)
@@ -103,7 +111,8 @@ class CivitAI_Model:
                                         if file_id and file_id == file_version:
                                             self.name = name
                                             self.name_friendly = file.get('name_friendly')
-                                            self.download_url = f"{file.get('downloadUrl')}?token={self.token}"
+                                            download_url = file.get('downloadUrl')
+                                            self.download_url = self._with_token(download_url)
                                             self.trained_words = file.get('trained_words')
                                             self.file_details = file
                                             self.file_id = file_version
@@ -137,7 +146,15 @@ class CivitAI_Model:
         # NO CACHE DATA FOUND | DOWNLOAD MODEL DETAILS
 
         model_url = f'{self.api}/models/{self.model_id}'
-        response = requests.get(model_url)
+        request_kwargs = {"timeout": 30}
+        if self._auth_headers:
+            request_kwargs["headers"] = dict(self._auth_headers)
+        if self._auth_params:
+            request_kwargs["params"] = dict(self._auth_params)
+        try:
+            response = requests.get(model_url, **request_kwargs)
+        except requests.exceptions.RequestException as exc:
+            raise Exception(f"{ERR_PREFIX}Unable to reach CivitAI API: {exc}") from exc
 
         if response.status_code == 200:
             model_data = response.json()
@@ -167,7 +184,7 @@ class CivitAI_Model:
                         for file in files:
                             download_url = file.get('downloadUrl')
                             if download_url == model_download_url:
-                                self.download_url = download_url + f"?token={self.token}"
+                                self.download_url = self._with_token(download_url)
                                 self.file_details = file
                                 self.file_id = file.get('id')
                                 self.name = file.get('name')
@@ -188,7 +205,7 @@ class CivitAI_Model:
                     for file in files:
                         download_url = file.get('downloadUrl')
                         if download_url == model_download_url:
-                            self.download_url = download_url + f"?token={self.token}"
+                            self.download_url = self._with_token(download_url)
                             self.file_details = file
                             self.file_id = file.get('id')
                             self.name = file.get('name')
@@ -203,6 +220,14 @@ class CivitAI_Model:
 
         else:
             raise Exception(f"{ERR_PREFIX}No cached model or model data found, and unable to reach CivitAI! Response Code: {response.status_code}\n Please try again later.")
+
+    def _with_token(self, url):
+        if not url:
+            return url
+        if self.token:
+            separator = '&' if '?' in url else '?'
+            return f"{url}{separator}token={self.token}"
+        return url
 
     def download(self):
     
@@ -220,6 +245,8 @@ class CivitAI_Model:
                     raise Exception(f"{ERR_PREFIX}Chunk {chunk_id} stalled for more than {max_retry_time} seconds without progress.")
                 try:
                     headers = {'Range': f'bytes={start_byte + downloaded_bytes}-{end_byte}'}
+                    if self._auth_headers:
+                        headers.update(self._auth_headers)
                     response = requests.get(url, headers=headers, stream=True, timeout=30)
                     if response.status_code == 206:
                         if retries > 0:
@@ -286,12 +313,18 @@ class CivitAI_Model:
         # GET FILE SIZE
         
         def get_total_file_size(url):
-            response = requests.get(url, stream=True)
+            request_kwargs = {'stream': True, 'timeout': 30}
+            if self._auth_headers:
+                request_kwargs['headers'] = dict(self._auth_headers)
+            response = requests.get(url, **request_kwargs)
             content_length = response.headers.get('Content-Length')
             if content_length is not None and content_length.isdigit():
                 return int(content_length)
 
-            response = requests.get(url, headers={'Range': 'bytes=0-999999999'}, stream=True)
+            range_headers = {'Range': 'bytes=0-999999999'}
+            if self._auth_headers:
+                range_headers.update(self._auth_headers)
+            response = requests.get(url, headers=range_headers, stream=True, timeout=30)
             content_range = response.headers.get('Content-Range')
             if content_range:
                 total_bytes = int(re.search(r'/(\d+)', content_range).group(1))
@@ -318,7 +351,8 @@ class CivitAI_Model:
                     return True
 
         if not self.name:
-            response = requests.head(self.download_url)
+            head_headers = dict(self._auth_headers)
+            response = requests.head(self.download_url, headers=head_headers if head_headers else None, timeout=30)
             if 'Content-Disposition' in response.headers:
                 content_disposition = response.headers['Content-Disposition']
                 self.name = re.findall("filename=(.+)", content_disposition)[0].strip('"')
@@ -344,10 +378,12 @@ class CivitAI_Model:
 
         # NO MODEL OR MODEL DATA AVAILABLE -- DOWNLOAD MODEL FROM CIVITAI
 
-        response = requests.head(self.download_url)
+        head_headers = dict(self._auth_headers)
+        response = requests.head(self.download_url, headers=head_headers if head_headers else None, timeout=30)
         total_file_size = total_file_size = get_total_file_size(self.download_url)
         
-        response = requests.get(self.download_url, stream=True)
+        get_headers = dict(self._auth_headers)
+        response = requests.get(self.download_url, headers=get_headers if get_headers else None, stream=True, timeout=30)
         if response.status_code != requests.codes.ok:
             raise Exception(f"{ERR_PREFIX}Failed to download {self.type} file from CivitAI. Status code: {response.status_code}")
             
@@ -508,9 +544,23 @@ class CivitAI_Model:
                                 return (model_id, version_id, file_details)
 
         api = f"{CivitAI_Model.api}/model-versions/by-hash/{hash_value}"
-        response = requests.get(api)
+        request_kwargs = {"timeout": 30}
+        token = CivitAI_Model._last_token or os.environ.get("CIVITAI_API_TOKEN")
+        auth_headers = {}
+        auth_params = {}
+        if token:
+            auth_headers["Authorization"] = f"Bearer {token}"
+            auth_params["token"] = token
+        if auth_headers:
+            request_kwargs["headers"] = auth_headers
+        if auth_params:
+            request_kwargs["params"] = auth_params
+        try:
+            response = requests.get(api, **request_kwargs)
+        except requests.exceptions.RequestException:
+            response = None
 
-        if response.status_code == 200:
+        if response and response.status_code == 200:
             model_details = response.json()
             if model_details:
                 model_id = model_details.get('modelId')
