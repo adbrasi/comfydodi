@@ -338,7 +338,8 @@ class CivitAI_Fast_LORA_Loader:
             },
         }
 
-    RETURN_TYPES = ("STRING",)
+    RETURN_TYPES = ("STRING", "*", "STRING")
+    RETURN_NAMES = ("lora_name", "any", "text")
     FUNCTION = "load_fast_lora"
     CATEGORY = "CivitAI/Fast"
 
@@ -354,14 +355,14 @@ class CivitAI_Fast_LORA_Loader:
     ):
         if lora_name and lora_name != 'none':
             print(f"{MSG_PREFIX}Using existing LORA: {lora_name}")
-            return (lora_name,)
+            return (lora_name, lora_name, lora_name)
 
         model_id, version_id = _parse_lora_air(lora_air)
         history = _load_history()
         cached_name = _find_cached_entry(history, model_id, version_id)
         if cached_name:
             print(f"{MSG_PREFIX}Found cached LORA `{cached_name}` for {model_id}@{version_id or 'latest'}")
-            return (cached_name,)
+            return (cached_name, cached_name, cached_name)
 
         resolved_path = _resolve_download_path(download_path)
         token = api_key or os.environ.get("CIVITAI_API_TOKEN")
@@ -377,4 +378,4 @@ class CivitAI_Fast_LORA_Loader:
         file_name, download_url = downloader.download(model_id, version_id)
         _record_entry(history, model_id, version_id, file_name, download_url)
         print(f"{MSG_PREFIX}Fast downloaded `{file_name}` to `{resolved_path}`")
-        return (file_name,)
+        return (file_name, file_name, file_name)
